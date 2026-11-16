@@ -154,3 +154,193 @@ class EntityCreateRequest(BaseModel):
     code: str
     name: str
     country: str | None = None
+
+
+# ---------------------------------------------------------------------------
+# Cross-entity evidence chain / authorization timeliness audit
+# ---------------------------------------------------------------------------
+
+CREDENTIAL_KINDS = Literal[
+    "entrusted_export",
+    "customs_authorization",
+    "title_transfer",
+    "intragroup_agreement",
+    "other",
+]
+
+PARTY_STATUSES = Literal["active", "suspended", "dissolved"]
+
+
+class PartyCreateRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    code: str
+    legal_name: str
+    uscc: str | None = None
+    country: str | None = None
+    is_branch: bool = False
+    head_office_code: str | None = None
+    valid_from: datetime | None = None
+    valid_to: datetime | None = None
+    status: PARTY_STATUSES = "active"
+    entity_code: str | None = None
+    source_document_id: int | None = None
+    original_location: str | None = None
+    sha256: str | None = None
+
+
+class PartyNameChangeRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    old_name: str
+    new_name: str
+    effective_from: datetime
+    uscc_verified: bool = False
+    inheritance_doc_no: str | None = None
+    inheritance_location: str | None = None
+    inheritance_sha256: str | None = None
+    source_document_id: int | None = None
+
+
+class PartyControlRelationRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    child_party_code: str
+    relation_type: Literal["control", "branch"] = "control"
+    valid_from: datetime | None = None
+    valid_to: datetime | None = None
+    source_document_id: int | None = None
+
+
+class CredentialCreateRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    entity_code: str
+    credential_no: str
+    kind: CREDENTIAL_KINDS
+    grantor_party_code: str
+    grantee_party_code: str
+    issued_at: datetime
+    received_time: datetime
+    effective_from: datetime
+    effective_to: datetime | None = None
+    scope: dict[str, Any] = Field(default_factory=dict)
+    quantity_limit: Decimal | None = None
+    currency: str | None = None
+    original_location: str
+    sha256: str | None = None
+    supersedes_credential_no: str | None = None
+    intragroup_acts_as: Literal["title_holder", "declarant"] | None = None
+    retroactive: bool = False
+    retroactive_scope_verified: bool = False
+    retroactive_from: datetime | None = None
+    source_document_id: int | None = None
+
+    _qty = field_validator("quantity_limit", mode="before")(_qty)
+
+    @field_validator("currency")
+    @classmethod
+    def _upper_currency(cls, v):
+        return v.upper() if v else v
+
+
+class CredentialRevocationRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    revocation_no: str
+    issuer_party_code: str
+    sequence_no: int | None = None
+    claimed_effective_from: datetime
+    signed_at: datetime
+    received_time: datetime
+    original_location: str
+    sha256: str | None = None
+    source_document_id: int | None = None
+
+
+class CredentialScopeRevisionRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    scope: dict[str, Any] = Field(default_factory=dict)
+    quantity_limit: Decimal | None = None
+    effective_from: datetime | None = None
+    effective_to: datetime | None = None
+    note: str | None = None
+
+    _qty = field_validator("quantity_limit", mode="before")(_qty)
+
+
+class CredentialReplacementRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    credential_no: str
+    issued_at: datetime
+    received_time: datetime
+    effective_from: datetime
+    effective_to: datetime | None = None
+    scope: dict[str, Any] | None = None
+    quantity_limit: Decimal | None = None
+    currency: str | None = None
+    original_location: str
+    sha256: str | None = None
+    source_document_id: int | None = None
+
+    _qty = field_validator("quantity_limit", mode="before")(_qty)
+
+    @field_validator("currency")
+    @classmethod
+    def _upper_currency(cls, v):
+        return v.upper() if v else v
+
+
+class AuditCaseCreateRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    export_line_id: int | None = None
+    invoice_line_id: int | None = None
+    customs_line_id: int | None = None
+    invoice_party_code: str
+    title_party_code: str
+    customs_party_code: str
+    region: str
+    product_sku: str | None = None
+    hs_code: str | None = None
+    recorded_names: dict[str, str] = Field(default_factory=dict)
+    note: str | None = None
+
+
+class AuditEvidenceLinkRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    role: Literal["contract", "packing", "transport", "title_document", "invoice_document", "customs_document", "other"]
+    node_ref: str
+    valid_from: datetime | None = None
+    valid_to: datetime | None = None
+    quantity: Decimal | None = None
+    source_document_id: int | None = None
+    original_location: str | None = None
+    sha256: str | None = None
+    detail: dict[str, Any] = Field(default_factory=dict)
+
+    _qty = field_validator("quantity", mode="before")(_qty)
+
+
+class AuditEvaluateRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    note: str | None = None
+    allow_truncated_search: bool = False
+
+
+class AuditSupplementRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    note: str | None = None
+    links: list[AuditEvidenceLinkRequest] = Field(default_factory=list)
+
+
+class AuditReviewDecisionRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    action: Literal["approve", "reject"]
+    note: str | None = None

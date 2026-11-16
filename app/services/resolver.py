@@ -9,6 +9,7 @@ Evidence grades:
 from __future__ import annotations
 
 from decimal import Decimal
+from datetime import datetime, timezone
 
 from fastapi import HTTPException
 from sqlalchemy import select
@@ -56,6 +57,7 @@ def build_export_dossier(db: Session, export: m.ExportLine) -> m.Dossier:
         db.add(dossier)
         db.flush()
 
+    held = audit_hold(db, export, export.entity_id)
     members: list[dict] = []
     customs_match = tax_match = invoice_match = False
     qty_mismatch = False
@@ -174,6 +176,7 @@ def build_export_dossier(db: Session, export: m.ExportLine) -> m.Dossier:
             "declared_amount": export.declared_amount,
             "member_count": len(members),
             "packing_quantity_mismatch": qty_mismatch,
+            "audit_hold": held,
         }
     )
     db.flush()
@@ -287,6 +290,12 @@ def constrained_candidates(db: Session, txn: m.BankTransaction) -> list[dict]:
         grade = "C"
         if export.export_date is not None and export.export_date > txn.value_date:
             continue
+        held = audit_hold(db, export, txn.entity_id)
+        if held is not None:
+            reasons.append(
+                f"new dossier paused: {held['reason']} (audit {held['case_ref']})"
+            )
+            continue
         export_bal = db.scalar(
             select(m.Balance).where(m.Balance.side == "export_line", m.Balance.ref_id == export.id)
         )
@@ -337,6 +346,57 @@ def constrained_candidates(db: Session, txn: m.BankTransaction) -> list[dict]:
         )
     results.sort(key=lambda r: (r["constraints_matched"], r["export_line_id"]), reverse=True)
     return results
+
+
+def audit_hold(db: Session, export: m.ExportLine, entity_id: int) -> dict | None:
+    """Record and return why an export row cannot enter a new dossier, if its audit case says so.
+
+    When a previously raised hold no longer applies (for example after a review approval), the open
+    difference case is closed so it does not linger as a stale reason.
+    """
+    from .audit import hold_for_new_dossier
+
+    held = hold_for_new_dossier(db, export.id)
+    open_cases = db.scalars(
+        select(m.DifferenceCase).where(
+            m.DifferenceCase.kind == "audit_hold_new_dossier",
+            m.DifferenceCase.ref_type == "export_line",
+            m.DifferenceCase.ref_id == export.id,
+            m.DifferenceCase.state == "open",
+        )
+    ).all()
+    if held is None:
+        for case in open_cases:
+            case.state = "resolved"
+            case.resolved_at = datetime.now(timezone.utc)
+        return None
+    if open_cases:
+        open_cases[0].detail = jsonable(
+            {
+                **held,
+                "rule": "a current audit conclusion under review or not importable pauses new "
+                "dossiers; historical dossiers keep their frozen conclusion and basis",
+            }
+        )
+        return held
+    db.add(
+        m.DifferenceCase(
+            entity_id=entity_id,
+            kind="audit_hold_new_dossier",
+            state="open",
+            ref_type="export_line",
+            ref_id=export.id,
+            detail=jsonable(
+                {
+                    **held,
+                    "rule": "a current audit conclusion under review or not importable pauses new "
+                    "dossiers; historical dossiers keep their frozen conclusion and basis",
+                }
+            ),
+        )
+    )
+    db.flush()
+    return held
 
 
 def create_reverse_candidate(db: Session, entity: m.Entity, doc: m.SourceDocument, req) -> m.ReverseCandidate:

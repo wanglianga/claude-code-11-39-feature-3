@@ -14,13 +14,13 @@ from decimal import Decimal
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from sqlalchemy import select, text
+from sqlalchemy import select
 
 from app import models as m
 from app.config import settings
 from app.db import SessionLocal, ensure_database, init_db
 from app.schemas import IntakeLine, IntakeRequest
-from app.services import balance, facts, ledgers, resolver
+from app.services import audit, audit_registry, balance, facts, ledgers, resolver
 from app.services.intake import ingest_document
 from app.util import key_hash
 
@@ -58,10 +58,11 @@ def seed(reset: bool = False) -> None:
     db = SessionLocal()
     try:
         if reset:
-            for table in reversed(m.Base.metadata.sorted_tables):
-                db.execute(text(f'TRUNCATE TABLE "{table.name}" RESTART IDENTITY CASCADE'))
+            # Rebuild the schema so option/column changes in this codebase are always picked up;
+            # the demo database is disposable and rebuilt from scratch.
+            m.Base.metadata.drop_all(bind=db.get_bind())
+            m.Base.metadata.create_all(bind=db.get_bind())
             db.commit()
-
         if db.scalar(select(m.Entity.id).limit(1)) is not None:
             print("database already seeded — use --reset to rebuild")
             return
@@ -248,9 +249,25 @@ def seed(reset: bool = False) -> None:
         db.commit()
         run = facts.compile_facts(db, entity_id=ents["ENT-A"].id, actor="seed")
         db.commit()
+        audit_summary = seed_audit(db, ents, exports, actor)
+        db.commit()
+
+        # The seeded pending/review conclusions legitimately block *new* dossiers. Re-run the
+        # resolver so the hold becomes visible in the demo data from the start.
+        resolver.resolve_all(db, ents["ENT-A"].id)
+        db.commit()
+        audit_summary["held_lines"] = sorted(
+            {
+                case.export_line_id
+                for case in db.scalars(select(m.AuditCase)).all()
+                if audit.hold_for_new_dossier(db, case.export_line_id) is not None
+            }
+        )
 
         print("seeded: entities=%d users=%d export_lines=%d facts=%d unallocated=%d differences=%d"
               % (len(ents), len(USERS), len(exports), run.facts_count, run.unallocated_count, run.differences_count))
+        print("audit: cases=%d conclusions=%s held_export_lines=%s"
+              % (len(audit_summary["cases"]), audit_summary["states"], audit_summary["held_lines"]))
         print()
         print("API keys (X-API-Key):")
         for name, role, key, codes in USERS:
@@ -260,6 +277,120 @@ def seed(reset: bool = False) -> None:
         print("swagger: http://127.0.0.1:8000/docs")
     finally:
         db.close()
+
+
+def seed_audit(db, ents, exports, actor: str) -> dict:
+    """Party archive, credential registry and per-row audit conclusions for the demo rows.
+
+    Row 1: title chain + customs authorization both effective before export but the authorization
+    was *received* after export (still confirmed, flagged for review).
+    Row 2: authorization issued after export with no verifiable retroactive scope -> pending.
+    Row 3: title transfer covers only part of the row -> restricted + broken-title segments.
+    """
+    from app.schemas import (
+        AuditCaseCreateRequest,
+        CredentialCreateRequest,
+        PartyCreateRequest,
+    )
+
+    parties = {}
+    for code, name, uscc in (
+        ("P-INV", "辰星跨境贸易有限公司", "91310000MA1FL00123"),
+        ("P-TIT", "辰星国际供应链有限公司", "91310000MA1FL00456"),
+        ("P-CUS", "辰星系报关服务有限公司", "91310000MA1FL00789"),
+    ):
+        parties[code] = audit_registry.create_party(
+            db,
+            PartyCreateRequest(
+                code=code,
+                legal_name=name,
+                uscc=uscc,
+                country="CN",
+                entity_code="ENT-A",
+                valid_from=T0,
+            ),
+            actor,
+        )
+
+    def cred(no, kind, grantor, grantee, limit, *, issued=T0, received=T0, effective=T0,
+             scope=None, retroactive=False, retro_verified=False, retro_from=None):
+        return audit_registry.create_credential(
+            db,
+            CredentialCreateRequest(
+                entity_code="ENT-A",
+                credential_no=no,
+                kind=kind,
+                grantor_party_code=grantor,
+                grantee_party_code=grantee,
+                issued_at=issued,
+                received_time=received,
+                effective_from=effective,
+                scope=scope or {"regions": ["CN"]},
+                quantity_limit=Decimal(limit),
+                currency="USD",
+                original_location=f"s3://demo/audit/{no}.pdf",
+                retroactive=retroactive,
+                retroactive_scope_verified=retro_verified,
+                retroactive_from=retro_from,
+            ),
+            actor,
+        )
+
+    received_late = datetime(2026, 10, 1, 8, 0, tzinfo=timezone.utc)
+    issued_late = datetime(2026, 9, 20, 8, 0, tzinfo=timezone.utc)
+    cases = []
+    states = []
+
+    def build(export, *, title_qty, auth_issued, auth_received, sku):
+        audit_registry.create_credential(
+            db,
+            CredentialCreateRequest(
+                entity_code="ENT-A",
+                credential_no=f"TT-{export.id}",
+                kind="title_transfer",
+                grantor_party_code="P-INV",
+                grantee_party_code="P-TIT",
+                issued_at=T0,
+                received_time=T0,
+                effective_from=T0,
+                scope={"regions": ["CN"], "skus": [sku]},
+                quantity_limit=Decimal(title_qty),
+                original_location=f"s3://demo/audit/TT-{export.id}.pdf",
+            ),
+            actor,
+        )
+        cred(
+            f"CA-{export.id}",
+            "customs_authorization",
+            "P-TIT",
+            "P-CUS",
+            "200",
+            issued=auth_issued,
+            received=auth_received,
+            effective=auth_issued,
+            scope={"regions": ["CN"], "skus": [sku], "customs_party_codes": ["P-CUS"]},
+        )
+        case = audit.build_case(
+            db,
+            ents["ENT-A"],
+            AuditCaseCreateRequest(
+                export_line_id=export.id,
+                invoice_party_code="P-INV",
+                title_party_code="P-TIT",
+                customs_party_code="P-CUS",
+                region="CN",
+                product_sku=sku,
+            ),
+            actor,
+        )
+        conclusion = audit.evaluate_case(db, case, actor=actor, kind="initial")
+        cases.append(case.id)
+        states.append(conclusion.state)
+
+    build(exports[0], title_qty="100", auth_issued=T0, auth_received=received_late, sku="SKU-AA-100")
+    build(exports[1], title_qty="50", auth_issued=issued_late, auth_received=issued_late, sku="SKU-BB-200")
+    build(exports[2], title_qty="8", auth_issued=T0, auth_received=T0, sku="SKU-CC-300")
+    return {"cases": cases, "states": states}
 
 
 def main() -> int:

@@ -480,6 +480,288 @@ class CompileRun(Base):
     result: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
 
 
+# ---------------------------------------------------------------------------
+# Cross-entity export evidence chain & authorization-timeliness audit
+#
+# Design invariants:
+#   * The party registry (法人主体/分支机构), name changes and control relations are
+#     versioned; validity is always evaluated at the export date, never "as of now".
+#   * The credential registry stores issued text metadata (issuer, scope, product/
+#     region limits, effective window, received time, original hash, replacement and
+#     revocation relations). Received time is recorded but never substitutes for
+#     the effective state on the export date.
+#   * The evidence graph links invoice party, title party, customs party, contract,
+#     packing list, transport vouchers and the export row through time-bounded claims.
+#   * Every conclusion row is versioned and freezes the party/credential/evidence
+#     versions it relied on. Historical conclusions are never rewritten; a new
+#     version is appended and old ones stay queryable.
+# ---------------------------------------------------------------------------
+
+
+class PartyProfile(Base):
+    """主体档案册 — legal entity / branch profile with validity and version."""
+
+    __tablename__ = "party_profiles"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    entity_id: Mapped[int | None] = mapped_column(ForeignKey("entities.id"), index=True)
+    code: Mapped[str] = mapped_column(String(64), unique=True, nullable=False)
+    legal_name: Mapped[str] = mapped_column(String(255), nullable=False)
+    uscc: Mapped[str | None] = mapped_column(String(64), index=True)
+    country: Mapped[str | None] = mapped_column(String(8))
+    is_branch: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    head_office_id: Mapped[int | None] = mapped_column(ForeignKey("party_profiles.id"))
+    valid_from: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    valid_to: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    status: Mapped[str] = mapped_column(String(24), nullable=False, default="active")
+    version: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    source_document_id: Mapped[int | None] = mapped_column(ForeignKey("source_documents.id"))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+
+
+class PartyNameChange(Base):
+    """名称变更登记. Must be verified by USCC or an official inheritance document."""
+
+    __tablename__ = "party_name_changes"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    party_id: Mapped[int] = mapped_column(ForeignKey("party_profiles.id"), nullable=False, index=True)
+    old_name: Mapped[str] = mapped_column(String(255), nullable=False)
+    new_name: Mapped[str] = mapped_column(String(255), nullable=False)
+    effective_from: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    uscc_verified: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    inheritance_doc_no: Mapped[str | None] = mapped_column(String(128))
+    inheritance_location: Mapped[str | None] = mapped_column(Text)
+    inheritance_sha256: Mapped[str | None] = mapped_column(String(64))
+    source_document_id: Mapped[int | None] = mapped_column(ForeignKey("source_documents.id"))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class PartyControlRelation(Base):
+    """控制关系 / 分支机构关系 with a validity interval (used for intragroup checks)."""
+
+    __tablename__ = "party_control_relations"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    parent_party_id: Mapped[int] = mapped_column(ForeignKey("party_profiles.id"), nullable=False, index=True)
+    child_party_id: Mapped[int] = mapped_column(ForeignKey("party_profiles.id"), nullable=False, index=True)
+    relation_type: Mapped[str] = mapped_column(String(32), nullable=False, default="control")
+    valid_from: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    valid_to: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    source_document_id: Mapped[int | None] = mapped_column(ForeignKey("source_documents.id"))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class AuthorizationCredential(Base):
+    """授权凭证册 — entrusted export, customs authorization, title transfer, intragroup agreement."""
+
+    __tablename__ = "authorization_credentials"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    entity_id: Mapped[int] = mapped_column(ForeignKey("entities.id"), nullable=False, index=True)
+    credential_no: Mapped[str] = mapped_column(String(128), nullable=False)
+    kind: Mapped[str] = mapped_column(String(48), nullable=False, index=True)
+    grantor_party_id: Mapped[int] = mapped_column(ForeignKey("party_profiles.id"), nullable=False, index=True)
+    grantee_party_id: Mapped[int] = mapped_column(ForeignKey("party_profiles.id"), nullable=False, index=True)
+    issued_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    received_time: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    effective_from: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    effective_to: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    scope: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
+    quantity_limit: Mapped[Decimal | None] = mapped_column(QTY)
+    currency: Mapped[str | None] = mapped_column(String(3))
+    original_location: Mapped[str] = mapped_column(Text, nullable=False)
+    sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    status: Mapped[str] = mapped_column(String(24), nullable=False, default="active")
+    frozen_reason: Mapped[str | None] = mapped_column(Text)
+    version: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    supersedes_id: Mapped[int | None] = mapped_column(ForeignKey("authorization_credentials.id"))
+    intragroup_acts_as: Mapped[str | None] = mapped_column(String(24))
+    retroactive: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    retroactive_scope_verified: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    retroactive_from: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    source_document_id: Mapped[int | None] = mapped_column(ForeignKey("source_documents.id"))
+    created_by: Mapped[str | None] = mapped_column(String(128))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+    __table_args__ = (
+        UniqueConstraint("entity_id", "credential_no", "version", name="uq_credential_entity_no_version"),
+        Index("ix_credential_kind_status", "kind", "status"),
+    )
+
+
+class CredentialRevocation(Base):
+    """撤销通知 — stored with issuer, verifiable sequence, effective/signed/received times and hash."""
+
+    __tablename__ = "credential_revocations"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    credential_id: Mapped[int] = mapped_column(
+        ForeignKey("authorization_credentials.id"), nullable=False, index=True
+    )
+    revocation_no: Mapped[str] = mapped_column(String(128), nullable=False)
+    issuer_party_id: Mapped[int] = mapped_column(ForeignKey("party_profiles.id"), nullable=False)
+    sequence_no: Mapped[int | None] = mapped_column(Integer)
+    claimed_effective_from: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    signed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    received_time: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    original_location: Mapped[str] = mapped_column(Text, nullable=False)
+    sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    status: Mapped[str] = mapped_column(String(24), nullable=False, default="recorded")
+    source_document_id: Mapped[int | None] = mapped_column(ForeignKey("source_documents.id"))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+    __table_args__ = (
+        UniqueConstraint("credential_id", "revocation_no", name="uq_revocation_credential_no"),
+    )
+
+
+class AuditCase(Base):
+    """审计案卷 — built from an invoice line and a customs goods line."""
+
+    __tablename__ = "audit_cases"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    entity_id: Mapped[int] = mapped_column(ForeignKey("entities.id"), nullable=False, index=True)
+    case_ref: Mapped[str] = mapped_column(String(128), nullable=False, unique=True)
+    export_line_id: Mapped[int] = mapped_column(
+        ForeignKey("export_lines.id"), nullable=False, unique=True, index=True
+    )
+    invoice_line_id: Mapped[int | None] = mapped_column(ForeignKey("invoice_lines.id"))
+    customs_line_id: Mapped[int | None] = mapped_column(ForeignKey("customs_lines.id"))
+    invoice_party_id: Mapped[int] = mapped_column(ForeignKey("party_profiles.id"), nullable=False)
+    title_party_id: Mapped[int] = mapped_column(ForeignKey("party_profiles.id"), nullable=False)
+    customs_party_id: Mapped[int] = mapped_column(ForeignKey("party_profiles.id"), nullable=False)
+    product_sku: Mapped[str | None] = mapped_column(String(64))
+    hs_code: Mapped[str | None] = mapped_column(String(20))
+    description: Mapped[str | None] = mapped_column(Text)
+    country: Mapped[str | None] = mapped_column(String(8))
+    quantity: Mapped[Decimal] = mapped_column(QTY, nullable=False)
+    amount: Mapped[Decimal] = mapped_column(MONEY, nullable=False)
+    currency: Mapped[str] = mapped_column(String(3), nullable=False)
+    export_date: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    recorded_names: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
+    status: Mapped[str] = mapped_column(String(24), nullable=False, default="open")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+
+
+class AuditEvidenceLink(Base):
+    """证据关系图节点/主张 — party role anchors and contract/packing/transport evidence."""
+
+    __tablename__ = "audit_evidence_links"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    case_id: Mapped[int] = mapped_column(ForeignKey("audit_cases.id"), nullable=False, index=True)
+    node_kind: Mapped[str] = mapped_column(String(32), nullable=False)
+    node_ref: Mapped[str] = mapped_column(String(128), nullable=False)
+    role: Mapped[str] = mapped_column(String(48), nullable=False)
+    valid_from: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    valid_to: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    quantity: Mapped[Decimal | None] = mapped_column(QTY)
+    source_document_id: Mapped[int | None] = mapped_column(ForeignKey("source_documents.id"))
+    original_location: Mapped[str | None] = mapped_column(Text)
+    sha256: Mapped[str | None] = mapped_column(String(64))
+    status: Mapped[str] = mapped_column(String(16), nullable=False, default="active")
+    detail: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class AuditConclusion(Base):
+    """审计结论册 — versioned; every evaluation appends a new version."""
+
+    __tablename__ = "audit_conclusions"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    case_id: Mapped[int] = mapped_column(ForeignKey("audit_cases.id"), nullable=False, index=True)
+    version: Mapped[int] = mapped_column(Integer, nullable=False)
+    is_current: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True, index=True)
+    status: Mapped[str] = mapped_column(String(24), nullable=False, default="active")
+    state: Mapped[str] = mapped_column(String(48), nullable=False)
+    quantity_confirmed: Mapped[Decimal] = mapped_column(QTY, nullable=False, default=0)
+    quantity_restricted: Mapped[Decimal] = mapped_column(QTY, nullable=False, default=0)
+    usable_for_new_dossier: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    review_approved: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    segments: Mapped[list] = mapped_column(JSONB, nullable=False, default=list)
+    witnesses: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
+    frozen_versions: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
+    reasoning: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
+    basis_cutoff: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    supersedes_id: Mapped[int | None] = mapped_column(ForeignKey("audit_conclusions.id"))
+    created_by: Mapped[str | None] = mapped_column(String(128))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+    __table_args__ = (
+        UniqueConstraint("case_id", "version", name="uq_conclusion_case_version"),
+        Index("ix_conclusion_status_usable", "status", "usable_for_new_dossier"),
+    )
+
+
+class ConclusionCredentialRef(Base):
+    """Dependency index: which conclusions rely on which credentials (for shared changes)."""
+
+    __tablename__ = "conclusion_credential_refs"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    conclusion_id: Mapped[int] = mapped_column(
+        ForeignKey("audit_conclusions.id"), nullable=False, index=True
+    )
+    credential_id: Mapped[int] = mapped_column(
+        ForeignKey("authorization_credentials.id"), nullable=False, index=True
+    )
+    role: Mapped[str] = mapped_column(String(24), nullable=False)
+    path_index: Mapped[int | None] = mapped_column(Integer)
+    step_index: Mapped[int | None] = mapped_column(Integer)
+    counted_quantity: Mapped[Decimal | None] = mapped_column(QTY)
+
+    __table_args__ = (
+        UniqueConstraint(
+            "conclusion_id", "credential_id", "role", "path_index", "step_index",
+            name="uq_conclusion_credential_step",
+        ),
+    )
+
+
+class AuditSharedChangeEvent(Base):
+    """共享凭证变动事件 — records affected rows, paused rows and per-row rejudgement."""
+
+    __tablename__ = "audit_shared_change_events"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    entity_id: Mapped[int] = mapped_column(ForeignKey("entities.id"), nullable=False, index=True)
+    credential_id: Mapped[int] = mapped_column(
+        ForeignKey("authorization_credentials.id"), nullable=False, index=True
+    )
+    kind: Mapped[str] = mapped_column(String(48), nullable=False)
+    detected_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    detail: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
+    affected_case_ids: Mapped[list] = mapped_column(JSONB, nullable=False, default=list)
+    paused_case_ids: Mapped[list] = mapped_column(JSONB, nullable=False, default=list)
+    unchanged_case_ids: Mapped[list] = mapped_column(JSONB, nullable=False, default=list)
+    rejudged: Mapped[list] = mapped_column(JSONB, nullable=False, default=list)
+    created_by: Mapped[str | None] = mapped_column(String(128))
+
+
+class AuditReviewEvent(Base):
+    """复审历史 — supplementary material, approval, revocation and coverage insufficiency."""
+
+    __tablename__ = "audit_review_events"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    case_id: Mapped[int] = mapped_column(ForeignKey("audit_cases.id"), nullable=False, index=True)
+    conclusion_id: Mapped[int | None] = mapped_column(ForeignKey("audit_conclusions.id"))
+    kind: Mapped[str] = mapped_column(String(48), nullable=False)
+    actor: Mapped[str | None] = mapped_column(String(128))
+    note: Mapped[str | None] = mapped_column(Text)
+    payload: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
 class User(Base):
     __tablename__ = "users"
 

@@ -140,6 +140,14 @@ def confirm_candidate(
         raise HTTPException(409, "candidate references missing bank transaction or export line")
     if txn.entity_id != export.entity_id:
         raise HTTPException(403, "cross-entity confirmation is not permitted")
+    from .resolver import audit_hold
+
+    held = audit_hold(db, export, txn.entity_id)
+    if held is not None:
+        raise HTTPException(
+            409,
+            f"new dossier paused for export line {export.id}: {held['reason']}",
+        )
 
     bals = _lock_balances(
         db, {("bank_transaction", txn.id), ("export_line", export.id)}
@@ -277,6 +285,11 @@ def auto_confirm_unique(db: Session, *, entity_id: int) -> list[int]:
         if len(targets) != 1:
             continue
         export_line_id = targets[0].id
+        from .resolver import audit_hold
+
+        if audit_hold(db, targets[0], entity_id) is not None:
+            # A new dossier may not reference this row while its audit conclusion is under review.
+            continue
         savepoint = db.begin_nested()
         try:
             candidate = db.scalar(
@@ -395,6 +408,11 @@ def generate_candidates(db: Session, txn: m.BankTransaction, actor: str) -> list
     out: list[m.ReconciliationCandidate] = []
     for entry in constrained_candidates(db, txn):
         if entry["export_line_id"] in existing:
+            continue
+        export = db.get(m.ExportLine, entry["export_line_id"])
+        from .resolver import audit_hold
+
+        if export is not None and audit_hold(db, export, txn.entity_id) is not None:
             continue
         cand = m.ReconciliationCandidate(
             entity_id=txn.entity_id,

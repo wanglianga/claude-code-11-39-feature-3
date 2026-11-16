@@ -9,7 +9,7 @@ from fastapi.openapi.docs import get_swagger_ui_html
 
 from .config import settings
 from .db import init_db
-from .routers import admin, intake, reconciliation
+from .routers import admin, audit, intake, reconciliation
 
 
 @asynccontextmanager
@@ -39,6 +39,14 @@ DESCRIPTION = """
 - 海关更正建立修订链，已提交行转为更正待处理，旧审核记录仍可回查。
 - 税务回执乱序时按签发时间与可验证序号转换；无法证明顺序时进入回执冲突。
 - 已确认关联进入复审时，新编译不把它计入已证实到账量，占用金额冻结。
+
+跨主体出口证据链一致性与授权时效审计
+- 主体档案册、授权凭证册与证据关系图在**出口日**判定跨主体关系；接收时间不替代出口日状态。
+- 出口后接收但出口日前已生效的授权可支持历史关系（复核核准后可引用）。
+- 出口后签发且无可验证追溯范围的授权只能标为待补证，不能回填出口日资格。
+- 部分货权覆盖拆为受限确认与货权断链两段；同一货权份额多路径只算一次；
+  搜索截断只给待补证，不断言不存在有效授权。
+- 互斥撤销冻结授权链；共享凭证变动先定位依赖行，再逐行重判，仅暂停失去有效见证的行。
 """
 
 app = FastAPI(
@@ -53,6 +61,7 @@ app = FastAPI(
 app.include_router(admin.router)
 app.include_router(intake.router)
 app.include_router(reconciliation.router)
+app.include_router(audit.router)
 
 
 @app.get("/health", tags=["meta"])
